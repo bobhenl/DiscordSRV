@@ -52,7 +52,12 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.regex.Matcher;
@@ -93,6 +98,22 @@ public class AlertListener implements Listener, EventListener {
     private final RegisteredListener listener;
     private final List<Dynamic> alerts = new ArrayList<>();
     private boolean registered = false;
+
+    // Async alerts run here instead of one scheduler task per event: the server's async scheduler has no thread cap,
+    // so a burst of events (e.g. a plugin firing one event per stored user at startup) whose alerts block on
+    // something shared (the account link database) used to leave thousands of threads waiting.
+    private final ExecutorService asyncExecutor = createAsyncExecutor();
+
+    private static ExecutorService createAsyncExecutor() {
+        AtomicInteger threadNumber = new AtomicInteger();
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(2, 2, 60, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), runnable -> {
+            Thread thread = new Thread(runnable, "DiscordSRV - Alerts #" + threadNumber.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
+    }
 
     public AlertListener() {
         listener = new RegisteredListener(
@@ -282,6 +303,7 @@ public class AlertListener implements Listener, EventListener {
     public void unregister() {
         HandlerList.unregisterAll(listener.getListener());
         registered = false;
+        asyncExecutor.shutdown();
     }
 
     @Override
@@ -358,7 +380,11 @@ public class AlertListener implements Listener, EventListener {
 
             if (async) {
                 int alertIndex = i;
-                SchedulerUtil.runTaskAsynchronously(DiscordSRV.getPlugin(), () -> process(event, alert, triggers, alertIndex));
+                try {
+                    asyncExecutor.execute(() -> process(event, alert, triggers, alertIndex));
+                } catch (RejectedExecutionException ignored) {
+                    // listener is being unregistered
+                }
             } else {
                 process(event, alert, triggers, i);
             }
